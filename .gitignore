@@ -1,0 +1,38 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Runtime data and local caches
+.gmp_cache/
+data/*
+!data/.gitkeep
+
+# Local backups
+_backup*/
+backup-*/
+*.bak
+*.sql.gz
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Backup files
+*.bak
+*.before-*
+*.backup
+
+# All source-code backup copies
+*.bak*
+*-backup
+*-backup.*
+*.before-*
+
+# Local server configuration; never commit
+/backend/config/config.php

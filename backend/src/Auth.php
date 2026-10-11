@@ -1,0 +1,245 @@
+<?php
+namespace Transdata\Nms;
+
+use PDO;
+
+class Auth
+{
+    private PDO $db;
+    private array $config;
+
+    public function __construct(PDO $db, array $config)
+    {
+        $this->db = $db;
+        $this->config = $config;
+    }
+
+    public function hasAdminUser(): bool
+    {
+        $stmt = $this->db->query("SELECT COUNT(*) as cnt FROM users");
+        $res = $stmt->fetch();
+        return ((int)($res['cnt'] ?? 0)) > 0;
+    }
+
+    public function createInitialAdmin(string $username, string $email, string $password, string $fullName): array
+    {
+        if ($this->hasAdminUser()) {
+            throw new \RuntimeException('Akun administrator pertama sudah dibuat.', 400);
+        }
+
+        if (strlen($password) < 8) {
+            throw new \InvalidArgumentException('Password minimal 8 karakter.', 400);
+        }
+
+        $hash = password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]);
+
+        $stmt = $this->db->prepare("
+            INSERT INTO users (username, email, password_hash, full_name, role_id, is_active)
+            VALUES (:username, :email, :password_hash, :full_name, 1, 1)
+        ");
+        $stmt->execute([
+            ':username'      => $username,
+            ':email'         => $email,
+            ':password_hash' => $hash,
+            ':full_name'     => $fullName
+        ]);
+
+        $userId = (int)$this->db->lastInsertId();
+        return $this->getUserById($userId);
+    }
+
+    public function login(string $username, string $password, string $ipAddress): array
+    {
+        $stmt = $this->db->prepare("
+            SELECT u.*, r.name as role_name
+            FROM users u
+            JOIN roles r ON u.role_id = r.id
+            WHERE (u.username = :user_name OR u.email = :user_email) AND u.is_active = 1
+        ");
+        $stmt->execute([
+            ':user_name'  => $username,
+            ':user_email' => $username
+        ]);
+        $user = $stmt->fetch();
+
+        if (!$user || !password_verify($password, $user['password_hash'])) {
+            throw new \RuntimeException('Username atau password salah.', 401);
+        }
+
+        // Update last login
+        $up = $this->db->prepare("UPDATE users SET last_login = NOW() WHERE id = :id");
+        $up->execute([':id' => $user['id']]);
+
+        // Generate token
+        $token = $this->generateToken([
+            'id'       => $user['id'],
+            'username' => $user['username'],
+            'role'     => $user['role_name'],
+            'role_id'  => $user['role_id']
+        ]);
+
+        unset($user['password_hash']);
+        return [
+            'token' => $token,
+            'user'  => $user
+        ];
+    }
+
+
+public function validateToken(?string $authHeader): ?array
+{
+    if (!$authHeader) {
+        return null;
+    }
+
+    $token = trim($authHeader);
+
+    if (preg_match('/Bearer\s+(\S+)/i', $authHeader, $matches)) {
+        $token = $matches[1];
+    }
+
+    $parts = explode('.', $token);
+    if (count($parts) !== 3) {
+        return null;
+    }
+
+    [$headerB64, $payloadB64, $sigB64] = $parts;
+
+    $secret = $this->config['app']['jwt_secret'] ?? '';
+    if (!is_string($secret) || strlen($secret) < 32) {
+        throw new \RuntimeException('JWT_SECRET belum dikonfigurasi dengan aman.');
+    }
+
+    $expectedSig = hash_hmac(
+        'sha256',
+        "$headerB64.$payloadB64",
+        $secret,
+        true
+    );
+
+    $expectedB64 = strtr(
+        rtrim(base64_encode($expectedSig), '='),
+        '+/',
+        '-_'
+    );
+
+    if (!hash_equals($expectedB64, rtrim($sigB64, '='))) {
+        return null;
+    }
+
+    $paddedPayload = $payloadB64;
+    $remainder = strlen($paddedPayload) % 4;
+
+    if ($remainder) {
+        $paddedPayload .= str_repeat('=', 4 - $remainder);
+    }
+
+    $decodedJson = base64_decode(
+        strtr($paddedPayload, '-_', '+/'),
+        true
+    );
+
+    if ($decodedJson === false) {
+        return null;
+    }
+
+    $payload = json_decode($decodedJson, true);
+
+    if (
+        !is_array($payload) ||
+        !isset($payload['id']) ||
+        (($payload['exp'] ?? 0) + 60) < time()
+    ) {
+        return null;
+    }
+
+    // Gunakan status dan role terbaru dari database.
+    $stmt = $this->db->prepare("
+        SELECT
+            u.id,
+            u.username,
+            u.email,
+            u.full_name,
+            u.role_id,
+            u.is_active,
+            r.name AS role_name
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        WHERE u.id = :id
+        LIMIT 1
+    ");
+
+    $stmt->execute([':id' => (int)$payload['id']]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$user || (int)$user['is_active'] !== 1) {
+        return null;
+    }
+
+    return [
+        'id'        => (int)$user['id'],
+        'username'  => $user['username'],
+        'email'     => $user['email'],
+        'full_name' => $user['full_name'],
+        'role_id'   => (int)$user['role_id'],
+        'role'      => $user['role_name'],
+        'role_name' => $user['role_name'],
+    ];
+}
+
+/**
+ * Periksa apakah role pengguna mempunyai permission tertentu.
+ */
+public function hasPermission(int $roleId, string $permission): bool
+{
+    $stmt = $this->db->prepare("
+        SELECT 1
+        FROM role_permissions rp
+        JOIN permissions p ON p.id = rp.permission_id
+        WHERE rp.role_id = :role_id
+          AND p.code = :permission
+        LIMIT 1
+    ");
+
+    $stmt->execute([
+        ':role_id' => $roleId,
+        ':permission' => $permission,
+    ]);
+
+    return (bool)$stmt->fetchColumn();
+}
+
+
+    public function getUserById(int $id): ?array
+    {
+        $stmt = $this->db->prepare("
+            SELECT u.id, u.username, u.email, u.full_name, u.role_id, r.name as role_name, u.is_active, u.created_at
+            FROM users u
+            JOIN roles r ON u.role_id = r.id
+            WHERE u.id = :id
+        ");
+        $stmt->execute([':id' => $id]);
+        $user = $stmt->fetch();
+        return $user ?: null;
+    }
+
+    private function generateToken(array $data): string
+    {
+        $secret = $this->config['app']['jwt_secret'] ?? '';
+        if (!is_string($secret) || strlen($secret) < 32) {
+            throw new \RuntimeException('JWT_SECRET belum dikonfigurasi dengan aman.');
+        }
+        $header = ['alg' => 'HS256', 'typ' => 'JWT'];
+        $payload = array_merge($data, [
+            'iat' => time(),
+            'exp' => time() + ($this->config['app']['session_lifetime'] ?? 86400)
+        ]);
+
+        $b64Header = strtr(rtrim(base64_encode(json_encode($header)), '='), '+/', '-_');
+        $b64Payload = strtr(rtrim(base64_encode(json_encode($payload)), '='), '+/', '-_');
+        $sig = hash_hmac('sha256', "$b64Header.$b64Payload", $secret, true);
+        $b64Sig = strtr(rtrim(base64_encode($sig), '='), '+/', '-_');
+
+        return "$b64Header.$b64Payload.$b64Sig";
+    }
+}
